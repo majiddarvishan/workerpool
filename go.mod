@@ -1,6 +1,8 @@
-module github.com/majiddarvishan/workerpool
+// module github.com/majiddarvishan/workerpool
 
-replace github.com/majiddarvishan/workerpool => /home/darvishan/tmp/go/workerpool
+// replace github.com/majiddarvishan/workerpool => /home/darvishan/tmp/go/workerpool
+
+module workerpool
 
 go 1.22
 

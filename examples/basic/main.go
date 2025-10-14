@@ -7,7 +7,8 @@ import (
     "time"
 
     "github.com/prometheus/client_golang/prometheus/promhttp"
-    "github.com/majiddarvishan/workerpool"
+    // "github.com/majiddarvishan/workerpool"
+    workerpool "workerpool/pkg/workerpool"
 )
 
 func main() {
