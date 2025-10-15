@@ -1,4 +1,4 @@
-module github.com/majiddarvishan/workerpool
+module github.com/majiddarvishan/snipgo
 
 go 1.20
 
