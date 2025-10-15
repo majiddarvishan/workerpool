@@ -1,10 +1,6 @@
-// module github.com/majiddarvishan/workerpool
+module github.com/majiddarvishan/workerpool
 
-// replace github.com/majiddarvishan/workerpool => /home/darvishan/tmp/go/workerpool
-
-module workerpool
-
-go 1.22
+go 1.20
 
 require github.com/prometheus/client_golang v1.19.0
 
