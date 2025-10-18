@@ -1,197 +1,184 @@
 package workerpool
 
 import (
-    "context"
-    "errors"
-    "fmt"
-    "sync"
-    "sync/atomic"
-    "time"
+	"fmt"
+	"sync"
+	"time"
 )
 
-// Result wraps the outcome of a task.
-type Result[T any] struct {
-    Value T
-    Err   error
+// Task represents a unit of work
+type Task func()
+
+// Future represents a future result of an asynchronous computation
+type Future struct {
+	result interface{}
+	err    error
+	done   chan struct{}
+	once   sync.Once
 }
 
-// Task is a unit of work.
-type Task[T any] func(ctx context.Context) (T, error)
-
-// Pool is a tunable worker pool.
-type Pool[T any] struct {
-    tasks    chan Task[T]
-    results  chan Result[T]
-    ctx      context.Context
-    cancel   context.CancelFunc
-    wg       sync.WaitGroup
-    opts     Options[T]
-
-    // metrics
-    activeWorkers int32
-    completed     int64
-    failed        int64
-
-    mu         sync.Mutex
-    numWorkers int
-    shutdown   bool
+// Get blocks until the result is available and returns it
+func (f *Future) Get() (interface{}, error) {
+	<-f.done
+	return f.result, f.err
 }
 
-// New creates a new pool with the given options.
-func New[T any](parent context.Context, opts Options[T]) *Pool[T] {
-    if opts.NumWorkers <= 0 {
-        opts.NumWorkers = 1
-    }
-    if opts.QueueSize <= 0 {
-        opts.QueueSize = 1
-    }
-    ctx, cancel := context.WithCancel(parent)
-    p := &Pool[T]{
-        tasks:      make(chan Task[T], opts.QueueSize),
-        results:    make(chan Result[T], opts.QueueSize),
-        ctx:        ctx,
-        cancel:     cancel,
-        opts:       opts,
-        numWorkers: opts.NumWorkers,
-    }
-    p.start(opts.NumWorkers)
-    return p
+// GetWithTimeout waits for the result with a timeout
+func (f *Future) GetWithTimeout(timeout time.Duration) (interface{}, error, bool) {
+	select {
+	case <-f.done:
+		return f.result, f.err, true
+	case <-time.After(timeout):
+		return nil, nil, false
+	}
 }
 
-func (p *Pool[T]) start(n int) {
-    for i := 0; i < n; i++ {
-        p.wg.Add(1)
-        go p.worker()
-    }
-    atomic.AddInt32(&p.activeWorkers, int32(n))
-    if p.opts.Metrics != nil {
-        p.opts.Metrics.ActiveWorkers.Set(float64(p.numWorkers))
-    }
+// IsDone checks if the task has completed
+func (f *Future) IsDone() bool {
+	select {
+	case <-f.done:
+		return true
+	default:
+		return false
+	}
 }
 
-func (p *Pool[T]) worker() {
-    defer p.wg.Done()
-    for {
-        select {
-        case <-p.ctx.Done():
-            return
-        case task, ok := <-p.tasks:
-            if !ok {
-                return
-            }
-            if p.opts.Hooks.OnStart != nil {
-                p.opts.Hooks.OnStart()
-            }
-            var res Result[T]
-            start := time.Now()
-            func() {
-                defer func() {
-                    if r := recover(); r != nil {
-                        err := fmt.Errorf("panic: %v", r)
-                        res.Err = err
-                        if p.opts.Hooks.OnError != nil {
-                            p.opts.Hooks.OnError(err)
-                        }
-                    }
-                }()
-                val, err := task(p.ctx)
-                res = Result[T]{Value: val, Err: err}
-            }()
-            latency := time.Since(start).Seconds()
-            if p.opts.Metrics != nil {
-                p.opts.Metrics.TaskLatency.Observe(latency)
-            }
-            if res.Err != nil {
-                atomic.AddInt64(&p.failed, 1)
-                if p.opts.Metrics != nil {
-                    p.opts.Metrics.TasksFailed.Inc()
-                }
-                if p.opts.Hooks.OnError != nil {
-                    p.opts.Hooks.OnError(res.Err)
-                }
-            } else {
-                atomic.AddInt64(&p.completed, 1)
-                if p.opts.Metrics != nil {
-                    p.opts.Metrics.TasksCompleted.Inc()
-                }
-            }
-            if p.opts.Hooks.OnFinish != nil {
-                p.opts.Hooks.OnFinish(res)
-            }
-            p.results <- res
-        }
-    }
+// ThreadPool manages a pool of worker goroutines
+type ThreadPool struct {
+	workers   int
+	taskQueue chan Task
+	wg        sync.WaitGroup
+	quit      chan struct{}
+	once      sync.Once
 }
 
-// Submit enqueues a task.
-func (p *Pool[T]) Submit(task Task[T]) error {
-    p.mu.Lock()
-    defer p.mu.Unlock()
-    if p.shutdown {
-        return errors.New("pool shutting down")
-    }
-    if p.opts.Hooks.OnSubmit != nil {
-        p.opts.Hooks.OnSubmit()
-    }
-    if p.opts.Metrics != nil {
-        p.opts.Metrics.TasksSubmitted.Inc()
-    }
-    select {
-    case p.tasks <- task:
-        return nil
-    case <-p.ctx.Done():
-        return errors.New("pool closed")
-    }
+// NewThreadPool creates a new thread pool with the specified number of workers
+func NewThreadPool(workers int, queueSize int) *ThreadPool {
+	if workers <= 0 {
+		workers = 1
+	}
+	if queueSize <= 0 {
+		queueSize = 100
+	}
+
+	tp := &ThreadPool{
+		workers:   workers,
+		taskQueue: make(chan Task, queueSize),
+		quit:      make(chan struct{}),
+	}
+
+	// Start worker goroutines
+	tp.wg.Add(workers)
+	for i := 0; i < workers; i++ {
+		go tp.worker(i)
+	}
+
+	return tp
 }
 
-// Resize changes the number of workers dynamically.
-func (p *Pool[T]) Resize(n int) {
-    p.mu.Lock()
-    defer p.mu.Unlock()
-    diff := n - p.numWorkers
-    if diff > 0 {
-        p.start(diff)
-    } else if diff < 0 {
-        // send poison pills
-        for i := 0; i < -diff; i++ {
-            p.tasks <- func(ctx context.Context) (T, error) {
-                return *new(T), errors.New("worker exit")
-            }
-        }
-    }
-    p.numWorkers = n
-    if p.opts.Metrics != nil {
-        p.opts.Metrics.ActiveWorkers.Set(float64(p.numWorkers))
-    }
+// worker is the goroutine that processes tasks
+func (tp *ThreadPool) worker(id int) {
+	defer tp.wg.Done()
+
+	for {
+		select {
+		case task, ok := <-tp.taskQueue:
+			if !ok {
+				return
+			}
+			task()
+		case <-tp.quit:
+			return
+		}
+	}
 }
 
-// Results returns the results channel.
-func (p *Pool[T]) Results() <-chan Result[T] {
-    return p.results
+// Submit adds a task to the thread pool (non-blocking)
+func (tp *ThreadPool) Submit(task Task) bool {
+	select {
+	case tp.taskQueue <- task:
+		return true
+	case <-tp.quit:
+		return false
+	default:
+		return false
+	}
 }
 
-// Metrics snapshot.
-func (p *Pool[T]) Metrics() (active int32, completed, failed int64, queued int) {
-    return atomic.LoadInt32(&p.activeWorkers),
-        atomic.LoadInt64(&p.completed),
-        atomic.LoadInt64(&p.failed),
-        len(p.tasks)
+// SubmitWait adds a task and blocks until it can be queued
+func (tp *ThreadPool) SubmitWait(task Task) bool {
+	select {
+	case tp.taskQueue <- task:
+		return true
+	case <-tp.quit:
+		return false
+	}
 }
 
-// Shutdown stops the pool.
-func (p *Pool[T]) Shutdown() {
-    p.mu.Lock()
-    if p.shutdown {
-        p.mu.Unlock()
-        return
-    }
-    p.shutdown = true
-    p.mu.Unlock()
+// SubmitWithResult submits a task that returns a result and error
+// Returns a Future to retrieve the result later
+func (tp *ThreadPool) SubmitWithResult(fn func() (interface{}, error)) *Future {
+	future := &Future{
+		done: make(chan struct{}),
+	}
 
-    if !p.opts.DrainOnShutdown {
-        p.cancel()
-    }
-    close(p.tasks)
-    p.wg.Wait()
-    close(p.results)
+	task := func() {
+		defer func() {
+			if r := recover(); r != nil {
+				future.err = fmt.Errorf("panic: %v", r)
+			}
+			future.once.Do(func() {
+				close(future.done)
+			})
+		}()
+
+		future.result, future.err = fn()
+	}
+
+	tp.SubmitWait(task)
+	return future
+}
+
+// SubmitWithResultNonBlocking submits a task that returns a result (non-blocking)
+// Returns nil if queue is full or shutting down
+func (tp *ThreadPool) SubmitWithResultNonBlocking(fn func() (interface{}, error)) *Future {
+	future := &Future{
+		done: make(chan struct{}),
+	}
+
+	task := func() {
+		defer func() {
+			if r := recover(); r != nil {
+				future.err = fmt.Errorf("panic: %v", r)
+			}
+			future.once.Do(func() {
+				close(future.done)
+			})
+		}()
+
+		future.result, future.err = fn()
+	}
+
+	if tp.Submit(task) {
+		return future
+	}
+	return nil
+}
+
+// Shutdown gracefully shuts down the thread pool
+func (tp *ThreadPool) Shutdown() {
+	tp.once.Do(func() {
+		close(tp.taskQueue)
+		tp.wg.Wait()
+		close(tp.quit)
+	})
+}
+
+// ShutdownNow immediately stops the thread pool
+func (tp *ThreadPool) ShutdownNow() {
+	tp.once.Do(func() {
+		close(tp.quit)
+		tp.wg.Wait()
+		close(tp.taskQueue)
+	})
 }
