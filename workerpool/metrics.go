@@ -11,6 +11,8 @@ type ThreadPoolMetrics struct {
 	TasksCompleted  *prometheus.CounterVec
 	TasksFailed     *prometheus.CounterVec
 	TasksRejected   *prometheus.CounterVec
+	TasksRetried    *prometheus.CounterVec
+	TasksTimedOut   *prometheus.CounterVec
 	TaskDuration    *prometheus.HistogramVec
 	QueueSize       *prometheus.GaugeVec
 	ActiveWorkers   *prometheus.GaugeVec
@@ -45,6 +47,20 @@ func NewThreadPoolMetrics() *ThreadPoolMetrics {
 			prometheus.CounterOpts{
 				Name: "threadpool_tasks_rejected_total",
 				Help: "Total number of tasks rejected (queue full)",
+			},
+			[]string{"pool_name"},
+		),
+		TasksRetried: promauto.NewCounterVec(
+			prometheus.CounterOpts{
+				Name: "threadpool_tasks_retried_total",
+				Help: "Total number of task submission retries",
+			},
+			[]string{"pool_name"},
+		),
+		TasksTimedOut: promauto.NewCounterVec(
+			prometheus.CounterOpts{
+				Name: "threadpool_tasks_timedout_total",
+				Help: "Total number of tasks that timed out during submission",
 			},
 			[]string{"pool_name"},
 		),
@@ -98,6 +114,16 @@ func (m *ThreadPoolMetrics) RecordTaskFailed(poolName string) {
 // RecordTaskRejected increments the rejected tasks counter
 func (m *ThreadPoolMetrics) RecordTaskRejected(poolName string) {
 	m.TasksRejected.WithLabelValues(poolName).Inc()
+}
+
+// RecordTaskRetried increments the retried tasks counter
+func (m *ThreadPoolMetrics) RecordTaskRetried(poolName string) {
+	m.TasksRetried.WithLabelValues(poolName).Inc()
+}
+
+// RecordTaskTimedOut increments the timed out tasks counter
+func (m *ThreadPoolMetrics) RecordTaskTimedOut(poolName string) {
+	m.TasksTimedOut.WithLabelValues(poolName).Inc()
 }
 
 // ObserveTaskDuration records task execution duration
