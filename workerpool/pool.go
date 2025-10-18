@@ -73,6 +73,8 @@ type ThreadPool struct {
 	name            string
 	workers         int
 	taskQueue       chan Task
+	overflowQueue   []Task
+	overflowMu      sync.Mutex
 	wg              sync.WaitGroup
 	quit            chan struct{}
 	once            sync.Once
@@ -97,6 +99,7 @@ func NewThreadPool(config ThreadPoolConfig) *ThreadPool {
 		name:            config.Name,
 		workers:         config.Workers,
 		taskQueue:       make(chan Task, config.QueueSize),
+		overflowQueue:   make([]Task, 0),
 		quit:            make(chan struct{}),
 		metrics:         config.Metrics,
 		rejectionPolicy: config.RejectionPolicy,
@@ -118,6 +121,9 @@ func NewThreadPool(config ThreadPoolConfig) *ThreadPool {
 
 	// Start queue size monitor
 	go tp.monitorQueueSize()
+
+	// Start overflow queue processor
+	go tp.processOverflowQueue()
 
 	return tp
 }
@@ -195,7 +201,47 @@ func (tp *ThreadPool) monitorQueueSize() {
 		select {
 		case <-ticker.C:
 			if tp.metrics != nil {
-				tp.metrics.SetQueueSize(tp.name, len(tp.taskQueue))
+				queueSize := len(tp.taskQueue)
+				tp.overflowMu.Lock()
+				overflowSize := len(tp.overflowQueue)
+				tp.overflowMu.Unlock()
+				tp.metrics.SetQueueSize(tp.name, queueSize+overflowSize)
+			}
+		case <-tp.quit:
+			return
+		}
+	}
+}
+
+// processOverflowQueue continuously tries to move tasks from overflow to main queue
+func (tp *ThreadPool) processOverflowQueue() {
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			tp.overflowMu.Lock()
+			if len(tp.overflowQueue) > 0 {
+				task := tp.overflowQueue[0]
+				tp.overflowMu.Unlock()
+
+				// Try to move to main queue (non-blocking)
+				select {
+				case tp.taskQueue <- task:
+					// Successfully moved, remove from overflow
+					tp.overflowMu.Lock()
+					if len(tp.overflowQueue) > 0 {
+						tp.overflowQueue = tp.overflowQueue[1:]
+					}
+					tp.overflowMu.Unlock()
+				case <-tp.quit:
+					return
+				default:
+					// Main queue still full, try again later
+				}
+			} else {
+				tp.overflowMu.Unlock()
 			}
 		case <-tp.quit:
 			return
@@ -304,6 +350,63 @@ func (tp *ThreadPool) SubmitWithRetry(task Task, attempts int, delay time.Durati
 	return false
 }
 
+// SubmitForce forcibly accepts a task even if the queue is full
+// Uses an overflow queue that will be processed when main queue has space
+// This GUARANTEES the task will be accepted and eventually executed
+func (tp *ThreadPool) SubmitForce(task Task) bool {
+	if tp.metrics != nil {
+		tp.metrics.RecordTaskSubmitted(tp.name)
+	}
+
+	select {
+	case <-tp.quit:
+		if tp.metrics != nil {
+			tp.metrics.RecordTaskRejected(tp.name)
+		}
+		return false
+	case tp.taskQueue <- task:
+		// Successfully added to main queue
+		return true
+	default:
+		// Main queue is full, add to overflow queue
+		tp.overflowMu.Lock()
+		tp.overflowQueue = append(tp.overflowQueue, task)
+		tp.overflowMu.Unlock()
+		return true
+	}
+}
+
+// SubmitForceWithPriority forcibly accepts a task with priority
+// High priority tasks are added to the front of the overflow queue
+func (tp *ThreadPool) SubmitForceWithPriority(task Task, highPriority bool) bool {
+	if tp.metrics != nil {
+		tp.metrics.RecordTaskSubmitted(tp.name)
+	}
+
+	select {
+	case <-tp.quit:
+		if tp.metrics != nil {
+			tp.metrics.RecordTaskRejected(tp.name)
+		}
+		return false
+	case tp.taskQueue <- task:
+		// Successfully added to main queue
+		return true
+	default:
+		// Main queue is full, add to overflow queue
+		tp.overflowMu.Lock()
+		if highPriority {
+			// Add to front of overflow queue
+			tp.overflowQueue = append([]Task{task}, tp.overflowQueue...)
+		} else {
+			// Add to back of overflow queue
+			tp.overflowQueue = append(tp.overflowQueue, task)
+		}
+		tp.overflowMu.Unlock()
+		return true
+	}
+}
+
 // SubmitWithContext submits a task that can be cancelled via context
 func (tp *ThreadPool) SubmitWithContext(ctx context.Context, fn TaskWithContext) bool {
 	task := func() {
@@ -390,6 +493,18 @@ func (tp *ThreadPool) GetQueueSize() int {
 	return len(tp.taskQueue)
 }
 
+// GetOverflowQueueSize returns the current number of tasks in the overflow queue
+func (tp *ThreadPool) GetOverflowQueueSize() int {
+	tp.overflowMu.Lock()
+	defer tp.overflowMu.Unlock()
+	return len(tp.overflowQueue)
+}
+
+// GetTotalQueueSize returns the total number of tasks (main + overflow queues)
+func (tp *ThreadPool) GetTotalQueueSize() int {
+	return tp.GetQueueSize() + tp.GetOverflowQueueSize()
+}
+
 // GetActiveWorkers returns the current number of active workers
 func (tp *ThreadPool) GetActiveWorkers() int {
 	tp.activeWorkerMu.Lock()
@@ -414,3 +529,4 @@ func (tp *ThreadPool) ShutdownNow() {
 		close(tp.taskQueue)
 	})
 }
+

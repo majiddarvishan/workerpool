@@ -147,14 +147,64 @@ func main() {
 	fmt.Printf("Queue size: %d\n", pool3.GetQueueSize())
 	fmt.Printf("Active workers: %d\n", pool3.GetActiveWorkers())
 
+	// Example 8: Force submit (always accepts tasks)
+	pool4 := workerpool.NewThreadPool(workerpool.ThreadPoolConfig{
+		Name:            "force_pool",
+		Workers:         2,
+		QueueSize:       3,
+		Metrics:         metrics,
+		RejectionPolicy: workerpool.DiscardPolicy,
+	})
+
+	fmt.Println("\n=== Example 8: Force Submit (Overflow Queue) ===")
+	// Submit more tasks than queue can handle - all will be accepted
+	for i := 0; i < 15; i++ {
+		taskID := i
+		pool4.SubmitForce(func() {
+			fmt.Printf("[force_pool] Task %d executing\n", taskID)
+			time.Sleep(200 * time.Millisecond)
+		})
+	}
+
+	fmt.Printf("Main queue size: %d\n", pool4.GetQueueSize())
+	fmt.Printf("Overflow queue size: %d\n", pool4.GetOverflowQueueSize())
+	fmt.Printf("Total queue size: %d\n", pool4.GetTotalQueueSize())
+
+	// Example 9: Force submit with priority
+	fmt.Println("\n=== Example 9: Force Submit with Priority ===")
+	pool5 := workerpool.NewThreadPool(workerpool.ThreadPoolConfig{
+		Name:            "priority_pool",
+		Workers:         1,
+		QueueSize:       2,
+		Metrics:         metrics,
+		RejectionPolicy: workerpool.DiscardPolicy,
+	})
+
+	// Fill the queue
+	for i := 0; i < 5; i++ {
+		taskID := i
+		pool5.SubmitForce(func() {
+			fmt.Printf("[priority_pool] Normal task %d\n", taskID)
+			time.Sleep(300 * time.Millisecond)
+		})
+	}
+
+	// Submit high priority task - it will jump to front of overflow queue
+	pool5.SubmitForceWithPriority(func() {
+		fmt.Println("[priority_pool] HIGH PRIORITY TASK - should execute before normal tasks")
+		time.Sleep(300 * time.Millisecond)
+	}, true)
+
 	// Wait for tasks to complete
-	time.Sleep(2 * time.Second)
+	time.Sleep(5 * time.Second)
 
 	// Shutdown all pools
 	fmt.Println("\n=== Shutting down thread pools ===")
 	pool1.Shutdown()
 	pool2.Shutdown()
 	pool3.Shutdown()
+	pool4.Shutdown()
+	pool5.Shutdown()
 	fmt.Println("Thread pools shut down successfully")
 	fmt.Println("\nCheck metrics at http://localhost:2112/metrics")
 
