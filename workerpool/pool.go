@@ -45,15 +45,19 @@ func (f *Future) IsDone() bool {
 
 // ThreadPool manages a pool of worker goroutines
 type ThreadPool struct {
-	workers   int
-	taskQueue chan Task
-	wg        sync.WaitGroup
-	quit      chan struct{}
-	once      sync.Once
+	name           string
+	workers        int
+	taskQueue      chan Task
+	wg             sync.WaitGroup
+	quit           chan struct{}
+	once           sync.Once
+	activeWorkerMu sync.Mutex
+	activeCount    int
+	metrics        *ThreadPoolMetrics
 }
 
 // NewThreadPool creates a new thread pool with the specified number of workers
-func NewThreadPool(workers int, queueSize int) *ThreadPool {
+func NewThreadPool(name string, workers int, queueSize int, metrics *ThreadPoolMetrics) *ThreadPool {
 	if workers <= 0 {
 		workers = 1
 	}
@@ -62,9 +66,18 @@ func NewThreadPool(workers int, queueSize int) *ThreadPool {
 	}
 
 	tp := &ThreadPool{
+		name:      name,
 		workers:   workers,
 		taskQueue: make(chan Task, queueSize),
 		quit:      make(chan struct{}),
+		metrics:   metrics,
+	}
+
+	// Initialize metrics
+	if tp.metrics != nil {
+		tp.metrics.SetWorkerCount(name, workers)
+		tp.metrics.SetQueueSize(name, 0)
+		tp.metrics.SetActiveWorkers(name, 0)
 	}
 
 	// Start worker goroutines
@@ -72,6 +85,9 @@ func NewThreadPool(workers int, queueSize int) *ThreadPool {
 	for i := 0; i < workers; i++ {
 		go tp.worker(i)
 	}
+
+	// Start queue size monitor
+	go tp.monitorQueueSize()
 
 	return tp
 }
@@ -86,7 +102,71 @@ func (tp *ThreadPool) worker(id int) {
 			if !ok {
 				return
 			}
-			task()
+
+			tp.incrementActiveWorkers()
+
+			start := time.Now()
+			func() {
+				defer func() {
+					duration := time.Since(start).Seconds()
+					if tp.metrics != nil {
+						tp.metrics.ObserveTaskDuration(tp.name, duration)
+					}
+
+					if r := recover(); r != nil {
+						if tp.metrics != nil {
+							tp.metrics.RecordTaskFailed(tp.name)
+							tp.metrics.RecordTaskCompleted(tp.name, "failed")
+						}
+						fmt.Printf("[%s] Task panicked: %v\n", tp.name, r)
+					} else {
+						if tp.metrics != nil {
+							tp.metrics.RecordTaskCompleted(tp.name, "success")
+						}
+					}
+
+					tp.decrementActiveWorkers()
+				}()
+				task()
+			}()
+
+		case <-tp.quit:
+			return
+		}
+	}
+}
+
+// incrementActiveWorkers increments the active worker count
+func (tp *ThreadPool) incrementActiveWorkers() {
+	tp.activeWorkerMu.Lock()
+	tp.activeCount++
+	if tp.metrics != nil {
+		tp.metrics.SetActiveWorkers(tp.name, tp.activeCount)
+	}
+	tp.activeWorkerMu.Unlock()
+}
+
+// decrementActiveWorkers decrements the active worker count
+func (tp *ThreadPool) decrementActiveWorkers() {
+	tp.activeWorkerMu.Lock()
+	tp.activeCount--
+	if tp.metrics != nil {
+		tp.metrics.SetActiveWorkers(tp.name, tp.activeCount)
+	}
+	tp.activeWorkerMu.Unlock()
+}
+
+// monitorQueueSize monitors and reports queue size
+func (tp *ThreadPool) monitorQueueSize() {
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			if tp.metrics != nil {
+				tp.metrics.SetQueueSize(tp.name, len(tp.taskQueue))
+			}
 		case <-tp.quit:
 			return
 		}
@@ -95,28 +175,44 @@ func (tp *ThreadPool) worker(id int) {
 
 // Submit adds a task to the thread pool (non-blocking)
 func (tp *ThreadPool) Submit(task Task) bool {
+	if tp.metrics != nil {
+		tp.metrics.RecordTaskSubmitted(tp.name)
+	}
+
 	select {
 	case tp.taskQueue <- task:
 		return true
 	case <-tp.quit:
+		if tp.metrics != nil {
+			tp.metrics.RecordTaskRejected(tp.name)
+		}
 		return false
 	default:
+		if tp.metrics != nil {
+			tp.metrics.RecordTaskRejected(tp.name)
+		}
 		return false
 	}
 }
 
 // SubmitWait adds a task and blocks until it can be queued
 func (tp *ThreadPool) SubmitWait(task Task) bool {
+	if tp.metrics != nil {
+		tp.metrics.RecordTaskSubmitted(tp.name)
+	}
+
 	select {
 	case tp.taskQueue <- task:
 		return true
 	case <-tp.quit:
+		if tp.metrics != nil {
+			tp.metrics.RecordTaskRejected(tp.name)
+		}
 		return false
 	}
 }
 
 // SubmitWithResult submits a task that returns a result and error
-// Returns a Future to retrieve the result later
 func (tp *ThreadPool) SubmitWithResult(fn func() (interface{}, error)) *Future {
 	future := &Future{
 		done: make(chan struct{}),
@@ -140,7 +236,6 @@ func (tp *ThreadPool) SubmitWithResult(fn func() (interface{}, error)) *Future {
 }
 
 // SubmitWithResultNonBlocking submits a task that returns a result (non-blocking)
-// Returns nil if queue is full or shutting down
 func (tp *ThreadPool) SubmitWithResultNonBlocking(fn func() (interface{}, error)) *Future {
 	future := &Future{
 		done: make(chan struct{}),

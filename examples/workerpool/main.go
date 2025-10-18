@@ -1,83 +1,48 @@
 package main
 
 import (
-    // "context"
     "fmt"
-    // "net/http"
+    "net/http"
     "time"
 
-    // "github.com/prometheus/client_golang/prometheus/promhttp"
+    "github.com/prometheus/client_golang/prometheus/promhttp"
     workerpool "github.com/majiddarvishan/snipgo/workerpool"
 )
 
-// func main() {
-//     // Start Prometheus metrics endpoint
-//     go func() {
-//         http.Handle("/metrics", promhttp.Handler())
-//         http.ListenAndServe(":2112", nil)
-//     }()
-
-//     ctx := context.Background()
-//     metrics := workerpool.NewMetrics("myapp", "workerpool")
-
-//     pool := workerpool.New[int](ctx, workerpool.Options[int]{
-//         NumWorkers:      4,
-//         QueueSize:       20,
-//         DrainOnShutdown: true,
-//         Metrics:         metrics, // attach metrics
-//     })
-
-//     for i := 0; i < 10; i++ {
-//         n := i
-//         _ = pool.Submit(func(ctx context.Context) (int, error) {
-//             time.Sleep(200 * time.Millisecond)
-//             return n * n, nil
-//         })
-//     }
-
-//     go func() {
-//         for res := range pool.Results() {
-//             if res.Err == nil {
-//                 fmt.Println("Result:", res.Value)
-//             }
-//         }
-//     }()
-
-//     time.Sleep(3 * time.Second)
-//     pool.Shutdown()
-// }
-
 func main() {
-	pool := workerpool.NewThreadPool(3, 10)
+    metrics := workerpool.NewThreadPoolMetrics()
 
-	fmt.Println("=== Example 1: Simple tasks without return ===")
-	for i := 0; i < 3; i++ {
+	// Start Prometheus metrics server
+	go func() {
+		http.Handle("/metrics", promhttp.Handler())
+		fmt.Println("Prometheus metrics available at http://localhost:2112/metrics")
+		if err := http.ListenAndServe(":2112", nil); err != nil {
+			fmt.Printf("Error starting metrics server: %v\n", err)
+		}
+	}()
+
+    pool1 := workerpool.NewThreadPool("main_pool", 3, 10, metrics)
+    pool2 := workerpool.NewThreadPool("secondary_pool", 2, 5, metrics)
+
+	fmt.Println("=== Example 1: Simple tasks ===")
+	for i := 0; i < 5; i++ {
 		taskID := i
-		pool.SubmitWait(func() {
-			fmt.Printf("Simple task %d executing\n", taskID)
+		pool1.SubmitWait(func() {
+			fmt.Printf("[main_pool] Task %d executing\n", taskID)
 			time.Sleep(200 * time.Millisecond)
 		})
 	}
 
-	fmt.Println("\n=== Example 2: Tasks with parameters ===")
+	fmt.Println("\n=== Example 2: Tasks with results ===")
+	futures := make([]*workerpool.Future, 3)
 	for i := 0; i < 3; i++ {
 		taskID := i
-		pool.SubmitWait(func() {
-			processTask(taskID, fmt.Sprintf("data-%d", taskID))
+		futures[i] = pool1.SubmitWithResult(func() (interface{}, error) {
+			time.Sleep(300 * time.Millisecond)
+			return taskID * taskID, nil
 		})
 	}
 
-	fmt.Println("\n=== Example 3: Tasks with results ===")
-	// Submit tasks that return results
-	futures := make([]*workerpool.Future, 5)
-	for i := 0; i < 5; i++ {
-		taskID := i
-		futures[i] = pool.SubmitWithResult(func() (interface{}, error) {
-			return calculateSquare(taskID)
-		})
-	}
-
-	// Retrieve results
 	for i, future := range futures {
 		result, err := future.Get()
 		if err != nil {
@@ -87,76 +52,36 @@ func main() {
 		}
 	}
 
-	fmt.Println("\n=== Example 4: Tasks with complex results ===")
-	// Task returning struct
-	type UserInfo struct {
-		ID   int
-		Name string
-		Age  int
+	fmt.Println("\n=== Example 3: Multiple pools ===")
+	for i := 0; i < 5; i++ {
+		taskID := i
+		pool2.SubmitWait(func() {
+			fmt.Printf("[secondary_pool] Task %d executing\n", taskID)
+			time.Sleep(150 * time.Millisecond)
+		})
 	}
 
-	future := pool.SubmitWithResult(func() (interface{}, error) {
-		time.Sleep(300 * time.Millisecond)
-		return UserInfo{ID: 1, Name: "Alice", Age: 30}, nil
-	})
-
-	result, err := future.Get()
-	if err != nil {
-		fmt.Printf("Error: %v\n", err)
-	} else {
-		user := result.(UserInfo)
-		fmt.Printf("User: ID=%d, Name=%s, Age=%d\n", user.ID, user.Name, user.Age)
+	fmt.Println("\n=== Example 4: Task rejection (queue full) ===")
+	for i := 0; i < 15; i++ {
+		taskID := i
+		ok := pool2.Submit(func() {
+			fmt.Printf("[secondary_pool] Task %d executing\n", taskID)
+			time.Sleep(500 * time.Millisecond)
+		})
+		if !ok {
+			fmt.Printf("Task %d rejected (queue full)\n", taskID)
+		}
 	}
 
-	fmt.Println("\n=== Example 5: Tasks with errors ===")
-	// Task that returns an error
-	errorFuture := pool.SubmitWithResult(func() (interface{}, error) {
-		return nil, fmt.Errorf("something went wrong")
-	})
+	// Wait for metrics to be collected
+	time.Sleep(2 * time.Second)
 
-	result, err = errorFuture.Get()
-	if err != nil {
-		fmt.Printf("Got expected error: %v\n", err)
-	}
+	fmt.Println("\n=== Shutting down thread pools ===")
+	pool1.Shutdown()
+	pool2.Shutdown()
+	fmt.Println("Thread pools shut down successfully")
+	fmt.Println("\nCheck metrics at http://localhost:2112/metrics")
 
-	fmt.Println("\n=== Example 6: Tasks with timeout ===")
-	slowFuture := pool.SubmitWithResult(func() (interface{}, error) {
-		time.Sleep(2 * time.Second)
-		return "slow result", nil
-	})
-
-	result, err, ok := slowFuture.GetWithTimeout(500 * time.Millisecond)
-	if !ok {
-		fmt.Println("Task timed out")
-	} else {
-		fmt.Printf("Result: %v, Error: %v\n", result, err)
-	}
-
-	fmt.Println("\n=== Example 7: Check if done ===")
-	quickFuture := pool.SubmitWithResult(func() (interface{}, error) {
-		return "quick result", nil
-	})
-
-	time.Sleep(100 * time.Millisecond)
-	if quickFuture.IsDone() {
-		result, _ := quickFuture.Get()
-		fmt.Printf("Task completed with result: %v\n", result)
-	}
-
-	fmt.Println("\n=== Shutting down thread pool ===")
-	pool.Shutdown()
-	fmt.Println("Thread pool shut down successfully")
-}
-
-// Example task functions
-
-func processTask(id int, data string) {
-	fmt.Printf("Processing task %d with data: %s\n", id, data)
-	time.Sleep(200 * time.Millisecond)
-}
-
-func calculateSquare(n int) (interface{}, error) {
-	fmt.Printf("Calculating square of %d\n", n)
-	time.Sleep(300 * time.Millisecond)
-	return n * n, nil
+	// Keep server running to check metrics
+	time.Sleep(5 * time.Second)
 }
